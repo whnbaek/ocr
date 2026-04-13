@@ -2901,6 +2901,10 @@ u8 fctRedProcessUpMsg(ocrEventHcCollective_t * dself, ocrPolicyMsg_t * msg, up_p
     ocrPolicyMsg_t * deleteMsg =  NULL;
     //COL-EVTX: Did not implement phases: would need to get the response
     //of a phase if it comes back before a previous one.
+    /* oddContribs: true when the reduction tree has a phantom right-most
+     * slot (nbOfDescendants is even → nbTreeNodes = nbOfDescendants + 1).
+     * Missing from the original "Collective Event Prototype" commit. */
+    bool oddContribs = (nbOfDescendants > 0) && ((nbOfDescendants & 1u) == 0u);
     do {
         remoteContrib_t * rcontrib = getRemoteContrib(dself, lph, contribSlot);
         up_payload_t * myPayload = fctRedResolvePayload(myMsg);
