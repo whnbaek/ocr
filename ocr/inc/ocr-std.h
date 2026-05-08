@@ -102,7 +102,10 @@ extern void _ocrAssert(bool val, const char* str, const char* file, u32 line);
  *
  * @param[in] a  Condition for the assert
  */
-#define ASSERT(a) do { ocrPrintf("ASSERT is deprecated as of OCR v1.2.0... use ocrAssert\n"); } while(0);
+/* The deprecated fallback printed on every call without evaluating the
+ * condition; on hot paths every worker serialized on the stdout mutex.
+ * Drop the print, keep the no-op. */
+#define ASSERT(a) do { } while(0);
 
 #define ocrAssert(a)
 

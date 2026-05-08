@@ -235,6 +235,20 @@ static u8 hcDistDeferredProcessMessage(ocrPolicyDomain_t *self, ocrPolicyMsg_t *
  * Handle messages requiring remote communications, delegate locals to shared memory implementation.
  */
 u8 hcDistProcessMessage(ocrPolicyDomain_t *self, ocrPolicyMsg_t *msg, u8 isBlocking) {
+    /* Shutdown drain: drop outgoing blocking request-response messages
+     * other than the runlevel notification itself.  Without this, a
+     * caller would block waiting for a response from a peer that is
+     * also draining.  Locally-routed messages, one-way sends, responses
+     * flowing back, and the RL_NOTIFY protocol all pass through. */
+    extern volatile u8 gOcrShutdownDraining;
+    if (gOcrShutdownDraining &&
+        isBlocking &&
+        (msg->type & PD_MSG_TYPE_ONLY) != PD_MSG_MGT_RL_NOTIFY &&
+        (msg->destLocation != self->myLocation) &&
+        (msg->type & PD_MSG_REQUEST) &&
+        (msg->type & PD_MSG_REQ_RESPONSE)) {
+        return 0;
+    }
     // When isBlocking is false, it means the message processing is FULLY asynchronous.
     // Hence, when processMessage returns it is not guaranteed 'msg' contains the response,
     // even though PD_MSG_REQ_RESPONSE is set.
@@ -855,6 +869,10 @@ u8 hcDistProcessMessage(ocrPolicyDomain_t *self, ocrPolicyMsg_t *msg, u8 isBlock
         if ((msg->srcLocation != curLoc) && (msg->destLocation == curLoc)) {
             ocrAssert(PD_MSG_FIELD_I(runlevel) == RL_COMPUTE_OK);
             ocrAssert(PD_MSG_FIELD_I(properties) == (RL_REQUEST | RL_BARRIER | RL_TEAR_DOWN));
+            // Mark this PD as draining so subsequent outgoing blocking
+            // request-response messages are dropped (see hcDistProcessMessage entry).
+            extern volatile u8 gOcrShutdownDraining;
+            gOcrShutdownDraining = 1;
             // Incoming rl notify message from another PD
             ocrPolicyDomainHcDist_t * rself = ((ocrPolicyDomainHcDist_t*)self);
             // incr the shutdown counter (compete with hcDistPdSwitchRunlevel)

@@ -677,7 +677,11 @@ extern char * pd_msg_type_to_str(int type);
 #define ASSERT_BLOCK_END ocrAssert(false && "assert block failure"); }
 #else
 
-#define ASSERT(a) do { ocrPrintf("ASSERT is deprecated as of OCR v1.2.0... use ocrAssert\n"); } while(0);
+/* ASSERT is deprecated as of OCR v1.2.0 in favor of ocrAssert.  The
+ * original fallback printed a deprecation notice on every call without
+ * evaluating the condition; on hot paths every worker serialized on the
+ * stdout mutex.  Drop the print, keep the no-op. */
+#define ASSERT(a) do { } while(0);
 
 //FIXME should this be defined as a function that is wrapper for an internal ASSERT macro?
 #define ocrAssert(a)

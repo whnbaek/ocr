@@ -57,7 +57,15 @@ void platformInitMPIComm(int * argc, char *** argv) {
  * @brief Finalize the MPI library (no more remote calls after that).
  */
 void platformFinalizeMPIComm() {
-    RESULT_ASSERT(MPI_Finalize(), ==, MPI_SUCCESS);
+    /* When a single OS process hosts multiple commPlatform instances
+     * (multi-PD-per-process), each PD switching to RL_PD_OK runs this
+     * function.  MPI_Finalize is one-shot per process, so guard with
+     * MPI_Finalized to avoid the "Finalize after Finalize" check. */
+    int finalized = 0;
+    RESULT_ASSERT(MPI_Finalized(&finalized), ==, MPI_SUCCESS);
+    if (!finalized) {
+        RESULT_ASSERT(MPI_Finalize(), ==, MPI_SUCCESS);
+    }
 }
 
 //
@@ -1496,8 +1504,14 @@ static u8 MPICommSwitchRunlevel(ocrCommPlatform_t *self, ocrPolicyDomain_t *PD, 
             self->pd->fcts.pdFree(self->pd, mpiComm->sendHdlPool);
             self->pd->fcts.pdFree(self->pd, mpiComm->recvHdlPool);
             self->pd->fcts.pdFree(self->pd, mpiComm->recvFxdHdlPool);
-            PD->fcts.pdFree(PD, PD->neighbors);
-            PD->neighbors = NULL;
+            /* When multiple commPlatform instances share a single PD
+             * (one-process-many-platforms), only the first to reach this
+             * runlevel actually frees the neighbors array; the rest see
+             * NULL and must skip to avoid double-free. */
+            if (PD->neighbors != NULL) {
+                PD->fcts.pdFree(PD, PD->neighbors);
+                PD->neighbors = NULL;
+            }
         }
         break;
     case RL_COMPUTE_OK:

@@ -12,8 +12,16 @@
 
 #define DEBUG_TYPE API
 
+/* Shutdown drain flag.  When non-zero, the runtime is tearing down
+ * across PDs: outgoing blocking request-response messages other than
+ * the runlevel notification itself are dropped at send time so callers
+ * do not wait indefinitely for a response from a peer that is also
+ * draining.  Set on shutdown initiation and on RL_NOTIFY receipt. */
+volatile u8 gOcrShutdownDraining = 0;
+
 static void ocrShutdownInternal(u8 errorCode) {
     DPRINTF(DEBUG_LVL_INFO, "ENTER ocrShutdown()\n");
+    gOcrShutdownDraining = 1;
     ocrPolicyDomain_t *pd = NULL;
     PD_MSG_STACK(msg);
     ocrPolicyMsg_t * msgPtr = &msg;
