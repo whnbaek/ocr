@@ -578,10 +578,21 @@ u8 labeledGuidGetVal(ocrGuidProvider_t* self, ocrGuid_t guid, u64* val, ocrGuidK
     ocrAssert(!ocrGuidIsNull(guid) && !ocrGuidIsError(guid) && !ocrGuidIsUninitialized(guid));
     ocrGuidProviderLabeled_t * dself = (ocrGuidProviderLabeled_t *) self;
     if (IS_RESERVED_GUID(guid)) {
-        // Current limitations for labeled GUID
-        // Only affinity and templates for now
+        // Reserved (labeled) GUIDs whose metadata lives on another location are
+        // resolved through the MD clone mechanism rather than refused.  Data
+        // blocks (and reduction events) implement the proxy-driven clone, so a
+        // fetch on those kinds falls through to the clone logic below.  Other
+        // reserved kinds (affinities, templates) are resolved by delegating to
+        // the owning location and do not support MD_FETCH.
         if (mode == MD_FETCH) {
-            RETURN_PROFILE(OCR_EPERM);
+            ocrGuidKind reservedKind = getKindFromGuid(guid);
+            bool fetchableReserved = (reservedKind == OCR_GUID_DB);
+#if defined(ENABLE_EXTENSION_DISTRIBUTED_LABELED) && defined(ENABLE_EXTENSION_COLLECTIVE_EVT)
+            fetchableReserved |= (reservedKind == OCR_GUID_EVENT_COLLECTIVE);
+#endif
+            if (!fetchableReserved) {
+                RETURN_PROFILE(OCR_EPERM);
+            }
         }
     }
     if (kind) {
@@ -624,13 +635,14 @@ u8 labeledGuidGetVal(ocrGuidProvider_t* self, ocrGuid_t guid, u64* val, ocrGuidK
             // This is a concurrent operation. Multiple concurrent call may try to do enqueue the proxy
 #if defined(ENABLE_EXTENSION_DISTRIBUTED_LABELED) && defined(ENABLE_EXTENSION_COLLECTIVE_EVT)
             ocrAssert(((mode == MD_FETCH) || (mode == MD_PROXY) || (mode == MD_ALLOC)) && (proxy != NULL));
-            // For labeled reduction events, we use the MD proxy mecanism, whether it's a local
-            // or remote GUID, else we should have delegated to the owner of the reserved GUID
-            ocrAssert(((IS_RESERVED_GUID(guid) ? (getKindFromGuid(guid) == OCR_GUID_EVENT_COLLECTIVE) : true)) && "Labeled Limitation");
+            // For labeled reduction events and data blocks, we use the MD proxy
+            // mecanism, whether it's a local or remote GUID; else we should have
+            // delegated to the owner of the reserved GUID.
+            ocrAssert(((IS_RESERVED_GUID(guid) ? ((getKindFromGuid(guid) == OCR_GUID_EVENT_COLLECTIVE) || (getKindFromGuid(guid) == OCR_GUID_DB)) : true)) && "Labeled Limitation");
 #else
             ocrAssert(((mode == MD_FETCH) || (mode == MD_PROXY)) && (proxy != NULL));
-            //For labeled, currently delegating directly to the remote location that owns the reserved GUID
-            ocrAssert(!IS_RESERVED_GUID(guid) && "Labeled Limitation");
+            //For labeled DBs we use the MD proxy/clone; other reserved kinds delegate to the owner.
+            ocrAssert((!IS_RESERVED_GUID(guid) || (getKindFromGuid(guid) == OCR_GUID_DB)) && "Labeled Limitation");
 #endif
             // Optimistically try to enqueue.
             ocrPolicyDomain_t * pd = self->pd;

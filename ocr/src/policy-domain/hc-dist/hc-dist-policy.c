@@ -485,11 +485,12 @@ u8 hcDistProcessMessage(ocrPolicyDomain_t *self, ocrPolicyMsg_t *msg, u8 isBlock
     {
 #define PD_MSG msg
 #define PD_TYPE PD_MSG_DB_CREATE
-        // The placer may have altered msg->destLocation
-        // We override in case the GUID is labeled
+        // Labeled DB: the home location is encoded in the GUID, so route the
+        // create to that home.  The datablock factory stages a local copy and
+        // writes the metadata back to the home on release (or forwards it for
+        // NO_ACQUIRE), exactly as for an affinity-homed DB.
         if (PD_MSG_FIELD_IO(properties) & GUID_PROP_IS_LABELED) {
             RETRIEVE_LOCATION_FROM_GUID_MSG(self, msg->destLocation, IO);
-            ocrAssert(false); //TODO need to think about how labeled DB creation plays out with MD
         }
 
         //TODO-MD: Pas cool. The DB carries a hint to a location that's used

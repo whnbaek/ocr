@@ -1819,7 +1819,22 @@ u8 newDataBlockLockable(ocrDataBlockFactory_t *factory, ocrFatGuid_t *guid, ocrF
     ocrLocation_t othLoc = INVALID_LOCATION;
     ocrLocation_t hintLoc;
     bool isLocal = true;
-    if(!(flags & GUID_PROP_IS_LABELED)) {
+    if (flags & GUID_PROP_IS_LABELED) {
+        // Labeled GUID: the home location is encoded in the GUID and the GUID is
+        // already valid, so no reservation is needed.  Resolve that home so a
+        // remote-homed labeled DB follows the same staged local creation +
+        // write-back-on-release path as an affinity-homed DB (the clone path in
+        // newDataBlockLockableInternal); only the GUID reservation differs.
+        ocrPolicyDomain_t * pd = NULL;
+        getCurrentEnv(&pd, NULL, NULL, NULL);
+        ocrLocation_t guidLoc = INVALID_LOCATION;
+        RESULT_ASSERT(pd->guidProviders[0]->fcts.getLocation(
+                          pd->guidProviders[0], guid->guid, &guidLoc), ==, 0);
+        isLocal = (guidLoc == pd->myLocation);
+        if (!isLocal) {
+            othLoc = guidLoc;
+        }
+    } else {
         u64 hintValue = 0ULL;
         if ((hint != NULL) && (ocrGetHintValue(hint, OCR_HINT_DB_AFFINITY, &hintValue) == 0) && (hintValue != 0)) {
             //TODO-MD: Overall this is kind of an expensive check for locality...
