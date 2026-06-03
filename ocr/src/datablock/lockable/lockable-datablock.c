@@ -1121,7 +1121,13 @@ u8 lockableAcquire(ocrDataBlock_t *self, void** ptr, ocrFatGuid_t edt, ocrLocati
 #endif
             }
         }
-        lowLevelAcquire(self, ptr, edt, edtSlot, othMode, isInternal, properties);
+        // On the async re-acquire path (a request gated on the metadata clone and
+        // reprocessed once the clone arrives), the grant is issued by
+        // processLocalAcquireCallbacks below, which also emits the deferred acquire
+        // response. Performing the acquire here as well would increment numUsers
+        // twice for a single acquire request, leaving the block permanently held.
+        if (!(properties & DB_PROP_ASYNC_ACQ))
+            lowLevelAcquire(self, ptr, edt, edtSlot, othMode, isInternal, properties);
         //TODO-MD-DBRTACQ
         //Came from a gated acquire waiting on MD, generate a response.
         if (properties & DB_PROP_ASYNC_ACQ) {
