@@ -21,6 +21,37 @@
 #include "extensions/ocr-affinity.h"
 #include "extensions/ocr-hints.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+/* End-to-end wall-clock span, mirroring the host runtime's init-excluded
+ * total-time counter: started once the blessed worker's mainEdt becomes
+ * eligible to run (called from whichever worker implementation runs the
+ * blessed/master setup - HC or HC_COMM), stopped when the shutdown
+ * runlevel notification is received on the master PD. */
+static struct timespec g_e2e_start;
+static int g_e2e_started = 0;
+void e2e_mark_start(void) {
+    if (!g_e2e_started) { clock_gettime(CLOCK_MONOTONIC, &g_e2e_start); g_e2e_started = 1; }
+}
+
+void hcWorkerReportE2E(void) {
+    if (g_e2e_started) {
+        /* Gated by $ARTS_E2E_MARKER: emit only when the measurement harness
+         * requests it, so a normal run's stderr is never perturbed. */
+        if (getenv("ARTS_E2E_MARKER")) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long long ns = (now.tv_sec - g_e2e_start.tv_sec) * 1000000000LL
+                         + (now.tv_nsec - g_e2e_start.tv_nsec);
+            fprintf(stderr, "[E2E] %lld\n", ns);
+            fflush(stderr);
+        }
+        g_e2e_started = 0; // report once
+    }
+}
+
 #if defined(STAT_EDT_EXEC)
 #include "statistics/metrics.h"
 #endif
@@ -412,6 +443,9 @@ static void workerLoop(ocrWorker_t * worker) {
 #endif
         // Once mainEdt is created, its template is no longer needed
         ocrEdtTemplateDestroy(edtTemplateGuid);
+
+        // mainEdt is now eligible to run: start the end-to-end timer.
+        e2e_mark_start();
     }
 
 #ifdef ENABLE_EXTENSION_PERF

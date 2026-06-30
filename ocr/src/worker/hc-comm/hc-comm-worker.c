@@ -539,6 +539,9 @@ static void workerLoopHcComm(ocrWorker_t * worker) {
         ocrEdtCreate(&edtGuid, edtTemplateGuid, EDT_PARAM_DEF, /* paramv = */ NULL,
                      /* depc = */ EDT_PARAM_DEF, /* depv = */ &dbGuid,
                      GUID_PROP_TORECORD, &edtHint, NULL);
+
+        // mainEdt is now eligible to run: start the end-to-end timer.
+        e2e_mark_start();
     }
 
     ocrAssert(worker->curState == GET_STATE(RL_USER_OK, PHASE_RUN));

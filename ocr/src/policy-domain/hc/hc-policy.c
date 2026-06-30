@@ -8,6 +8,8 @@
 #include "ocr-config.h"
 #ifdef ENABLE_POLICY_DOMAIN_HC
 
+#include <stdio.h>
+
 #include "debug.h"
 #include "ocr-errors.h"
 #include "ocr-db.h"
@@ -36,9 +38,10 @@
 #include "event/hc/hc-event.h"
 #include "workpile/hc/hc-workpile.h"
 
-#ifdef ENABLE_RESILIENCY
+// hc-worker.h is internally guarded by ENABLE_WORKER_HC; include
+// unconditionally here (rather than only under ENABLE_RESILIENCY) so its
+// declarations are visible whenever this PD pairs with the HC worker.
 #include "worker/hc/hc-worker.h"
-#endif
 
 #ifdef SHOW_BINDING_INFO
 #include <unistd.h> // For gethostname
@@ -3673,6 +3676,13 @@ u8 hcPolicyDomainProcessMessage(ocrPolicyDomain_t *self, ocrPolicyMsg_t *msg, u8
             u8 returnCode __attribute__((unused)) = self->fcts.switchRunlevel(
                               self, RL_USER_OK, RL_TEAR_DOWN | RL_ASYNC | RL_REQUEST | RL_FROM_MSG);
             ocrAssert(returnCode == 0);
+#ifdef ENABLE_WORKER_HC
+            // Shutdown received, teardown about to begin: stop the
+            // end-to-end timer on the master PD only.
+            if (self->myLocation == 0) {
+                hcWorkerReportE2E();
+            }
+#endif
         }
         msg->type &= ~PD_MSG_REQUEST;
         break;

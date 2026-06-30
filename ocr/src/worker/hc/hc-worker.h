@@ -53,5 +53,12 @@ typedef struct {
 
 ocrWorkerFactory_t* newOcrWorkerFactoryHc(ocrParamList_t *perType);
 
+/* End-to-end wall-clock span: mark the start once mainEdt becomes eligible
+ * to run (idempotent - first caller wins), and report the elapsed span to
+ * stderr as "[E2E] <nanoseconds>\n" at shutdown reception (no-op if the
+ * start was never marked, e.g. on a non-master PD). */
+void e2e_mark_start(void);
+void hcWorkerReportE2E(void);
+
 #endif /* ENABLE_WORKER_HC */
 #endif /* __HC_WORKER_H__ */
