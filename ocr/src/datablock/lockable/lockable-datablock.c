@@ -40,6 +40,14 @@
 
 #define DBG_LVL_LAZY DEBUG_LVL_INFO
 
+// No-hint DB home placement policy: 1 = round-robin the home location
+// across all locations, 0 = pin the home to the creator (legacy behavior).
+// A build that wires this to a specific value on the command line takes
+// precedence; a standalone build still defaults to round-robin.
+#ifndef OCR_NOHINT_DB_HOME_ROUNDROBIN
+#define OCR_NOHINT_DB_HOME_ROUNDROBIN 1
+#endif
+
 // Distributed implementation of lockable datablock. On creation the DB
 // is bound to a PD. Either the current PD or the one declared through
 // the affinity hint. Other PDs must require a clone of the DB metadata
@@ -878,6 +886,17 @@ static bool localAcquireShared(ocrDataBlock_t * self, ocrDataBlockLockableAttr_t
         // Shared is granted when in prime and transitioning to shared
         return false;
     }
+    if (attr->dbMode & WR_MASK) {
+        // The current shared grant is a WRITE grant checked out to a peer
+        // (only the home reaches shared state with a write mode). The resident
+        // copy is superseded by the writer's pending release write-back, so a
+        // new read acquisition must not be served from residency: defer it
+        // until the release restores read eligibility, exactly as a remote
+        // read request is deferred (see remoteAcquireShared). The waiter is
+        // drained by schedulePendingAcquire once the release write-back has
+        // been applied.
+        return false;
+    }
     // Read modes left
     if ((attr->dbMode == DB_RO) && (othMode == DB_CONST)) {
         // Transition RO => CONST
@@ -922,6 +941,17 @@ static bool remoteAcquireShared(ocrDataBlock_t * self, ocrDataBlockLockableAttr_
     if (!(attr->dbMode & WR_MASK)) {
         if ((attr->dbMode == DB_RO) && (othMode == DB_CONST)) {
             attr->dbMode = DB_CONST;
+        }
+        if (othMode & WR_MASK) {
+            // A write grant is being checked out while read grants may still
+            // be outstanding (their holders keep snapshots of the current
+            // payload; a later write-back displaces, not mutates, it). Record
+            // the write in the current mode so the grant is visible: both
+            // remote requests (the WR_MASK check above) and local requests at
+            // the home (localAcquireShared) must defer new acquisitions until
+            // the writer's release write-back lands, instead of being served
+            // the superseded resident copy.
+            attr->dbMode = othMode;
         }
         return true;
     }
@@ -1256,6 +1286,59 @@ static void schedulePending(ocrDataBlock_t *self) {
     } // else stay idle
 }
 
+// Park a payload buffer displaced by an incoming write-back while local
+// acquirers still hold pointers into it. Pointers handed out by acquire stay
+// valid until the acquirer releases, so the superseded buffer must survive
+// until the user count drains to zero. Caller must hold the instance lock.
+static void parkDisplacedBuffer(ocrDataBlockLockable_t *rself, void * buf, bool isMsgBuf) {
+    ocrPolicyDomain_t * pd = NULL;
+    getCurrentEnv(&pd, NULL, NULL, NULL);
+    dbDisplacedBuf_t * node = (dbDisplacedBuf_t *) pd->fcts.pdMalloc(pd, sizeof(dbDisplacedBuf_t));
+    node->ptr = buf;
+    node->isMsgBuf = isMsgBuf;
+    node->next = rself->displacedBufs;
+    rself->displacedBufs = node;
+}
+
+// Reclaim write-back-displaced payload buffers once no local acquirer remains.
+// Caller must hold the instance lock (or be the destructor with exclusive
+// access) and the user count must be zero.
+static void reclaimDisplacedBuffers(ocrDataBlock_t *self) {
+    ocrDataBlockLockable_t *rself = (ocrDataBlockLockable_t*)self;
+    dbDisplacedBuf_t * cur = rself->displacedBufs;
+    if (cur == NULL)
+        return;
+    ocrAssert(rself->attributes.numUsers == 0);
+    ocrPolicyDomain_t * pd = NULL;
+    getCurrentEnv(&pd, NULL, NULL, NULL);
+    rself->displacedBufs = NULL;
+    while (cur != NULL) {
+        dbDisplacedBuf_t * next = cur->next;
+        if (cur->isMsgBuf) {
+            pd->fcts.pdFree(pd, cur->ptr);
+        } else {
+            // Plain data payload: goes back through the DB allocator, same as
+            // the non-displaced frees in the write-back and destruct paths.
+            PD_MSG_STACK(msg);
+            getCurrentEnv(NULL, NULL, NULL, &msg);
+#define PD_MSG (&msg)
+#define PD_TYPE PD_MSG_MEM_UNALLOC
+            msg.type = PD_MSG_MEM_UNALLOC | PD_MSG_REQUEST;
+            PD_MSG_FIELD_I(allocatingPD.guid) = self->allocatingPD;
+            PD_MSG_FIELD_I(allocatingPD.metaDataPtr) = NULL;
+            PD_MSG_FIELD_I(allocator.guid) = self->allocator;
+            PD_MSG_FIELD_I(allocator.metaDataPtr) = NULL;
+            PD_MSG_FIELD_I(ptr) = cur->ptr;
+            PD_MSG_FIELD_I(type) = DB_MEMTYPE;
+            PD_MSG_FIELD_I(properties) = 0;
+            pd->fcts.processMessage(pd, &msg, false);
+#undef PD_MSG
+#undef PD_TYPE
+        }
+        pd->fcts.pdFree(pd, cur);
+        cur = next;
+    }
+}
 
 // Always called by release local to the current PD
 // 'edt' may be NULL_GUID here if we are doing a PD-level release
@@ -1308,6 +1391,10 @@ u8 lockableRelease(ocrDataBlock_t *self, ocrFatGuid_t edt, ocrLocation_t srcLoc,
     // would have lost the remote release competition
     ocrAssert(!rself->attributes.isReleasing);
     if (rself->attributes.numUsers == 0) {
+        // Last local acquirer checked out: buffers displaced by write-backs
+        // that arrived while it (or its peers) still held pointers can now
+        // be reclaimed.
+        reclaimDisplacedBuffers(self);
         if (rself->attributes.hasPeers) { // slave
             schedulePending(self);
         }
@@ -1473,6 +1560,9 @@ u8 lockableDestruct(ocrDataBlock_t *self) {
     // 2) This is the master, it can msg/data being either
     //    !null/!null, data points to msg's payload
     //    null/!null, has never been cloned
+    // Also reclaim any write-back-displaced buffers still parked; the user
+    // count is asserted zero above so the pointers into them are all dead.
+    reclaimDisplacedBuffers(self);
     if (rself->backingPtrMsg != NULL) {
         pd->fcts.pdFree(pd, rself->backingPtrMsg);
     } else {
@@ -1663,6 +1753,7 @@ static u8 newDataBlockLockableInternal(ocrDataBlockFactory_t *factory, ocrFatGui
     }
 #endif
     result->backingPtrMsg = NULL;
+    result->displacedBufs = NULL;
     u8 i;
     for(i=0; i < DB_MODE_COUNT; i++) {
         result->localWaitQueues[i] = NULL;
@@ -1813,6 +1904,31 @@ static u8 newDataBlockLockableInternal(ocrDataBlockFactory_t *factory, ocrFatGui
     if (flags & GUID_PROP_TORECORD) {
         RESULT_ASSERT(pd->guidProviders[0]->fcts.registerGuid(pd->guidProviders[0], result->base.guid, (u64) result), ==, 0);
     }
+    if (isClone && firstCreate && !isEager && (flags & DB_PROP_NO_ACQUIRE)) {
+        // A never-acquired datablock has no release to carry its deferred home
+        // registration; complete the home materialization at create time -
+        // placement policy must not depend on the acquire mode. The creator is
+        // never handed a pointer, so nothing local can be dirtied: send the
+        // pre-built creation write-back now, exactly as a release would. The
+        // home then owns the initial-payload instance as sole idle owner and
+        // this instance becomes an idle peer with no pending write-back
+        // obligation, matching the post-release state of the staged-creation
+        // protocol.
+        ocrWorker_t * worker = NULL;
+        getCurrentEnv(NULL, &worker, NULL, NULL);
+        hal_lock(&result->lock);
+        result->worker = worker;
+        ocrAssert(result->attributes.numUsers == 0);
+        ocrAssert(result->backingPtrMsg != NULL);
+        result->attributes.state = STATE_IDLE;
+        issueReleaseRequest((ocrDataBlock_t *) result);
+        result->worker = NULL;
+        hal_unlock(&result->lock);
+        // The instance's data pointer now lives at the home only.
+        if (ptr != NULL) {
+            *ptr = NULL;
+        }
+    }
     guid->guid = resultGuid;
     guid->metaDataPtr = result;
     return 0;
@@ -1842,6 +1958,7 @@ u8 newDataBlockLockable(ocrDataBlockFactory_t *factory, ocrFatGuid_t *guid, ocrF
         }
     } else {
         u64 hintValue = 0ULL;
+        bool hintTookEffect = false;
         if ((hint != NULL) && (ocrGetHintValue(hint, OCR_HINT_DB_AFFINITY, &hintValue) == 0) && (hintValue != 0)) {
             //TODO-MD: Overall this is kind of an expensive check for locality...
             ocrGuid_t affGuid;
@@ -1856,7 +1973,33 @@ u8 newDataBlockLockable(ocrDataBlockFactory_t *factory, ocrFatGuid_t *guid, ocrF
             ocrPolicyDomain_t * pd = NULL;
             getCurrentEnv(&pd, NULL, NULL, NULL);
             isLocal = (hintLoc == pd->myLocation);
+            hintTookEffect = true;
         }
+#if OCR_NOHINT_DB_HOME_ROUNDROBIN
+        // Only distribute the home of USER datablocks. A runtime-internal
+        // datablock (created and acquired by the runtime itself, marked by
+        // DB_PROP_RT_ACQUIRE - e.g. an event's dynamic waiter list) is acquired
+        // by the runtime under the invariant that it is homed on its creating
+        // location: such acquires are expected to grant synchronously rather
+        // than defer on a cross-location ownership fetch. Homing one on a remote
+        // location would defer that acquire and later resume it against the
+        // (by then possibly already freed) calling context. Keep them local.
+        if (!hintTookEffect && !(flags & DB_PROP_RT_ACQUIRE)) {
+            /* No affinity hint took effect: distribute the home round-robin across
+             * all locations instead of pinning every block to the creator.  Locations
+             * are 0-based ranks; total count is neighborCount + 1 (neighbors + self).
+             * Seed the shared counter with this location's own rank (a constant
+             * per-location offset) so that concurrent creators on every location
+             * start their round-robin sequence on a distinct location instead of
+             * all colliding on location 0 for their first pick. */
+            ocrPolicyDomain_t *rrPd = NULL;
+            getCurrentEnv(&rrPd, NULL, NULL, NULL);
+            static volatile u64 s_dbHomeRR = 0;
+            u64 pick = (hal_xadd64(&s_dbHomeRR, 1) + (u64)rrPd->myLocation) % ((u64)rrPd->neighborCount + 1);
+            hintLoc = (ocrLocation_t)pick;
+            isLocal = (hintLoc == rrPd->myLocation);
+        }
+#endif
 
         if (!isLocal) {
             othLoc = hintLoc;
@@ -2091,6 +2234,9 @@ u8 deserializeDataBlockLockable(u8* buffer, ocrDataBlock_t** self) {
     //TODO-resilience: see comment in serialize about lock and worker fields
     u64 workerId = (u64)(dstDb->worker);
     dstDb->worker = (workerId == ((u64)-1)) ? NULL : pd->workers[workerId];
+    // Displaced-buffer list is transient local state (only non-empty while
+    // local acquirers are checked in); it does not survive serialization.
+    dstDb->displacedBufs = NULL;
     buffer += len;
     offset += len;
 
@@ -2411,6 +2557,9 @@ static u8 lockableProcess(ocrObjectFactory_t * factory, ocrGuid_t guid, ocrObjec
             ocrAssert(attr.dbMode == DB_RO); // most liberal
             ocrAssert(attr.state == STATE_IDLE);
             ocrAssert(attr.numUsers == 0);
+            // Displaced buffers are reclaimed when the user count drains to
+            // zero, so with no user checked in the list must be empty here.
+            ocrAssert(rself->displacedBufs == NULL);
             ocrAssert(attr.hasPeers);
 #ifdef ENABLE_LAZY_DB
             if (rself->mdPeers != msg->srcLocation) {
@@ -2474,10 +2623,24 @@ static u8 lockableProcess(ocrObjectFactory_t * factory, ocrGuid_t guid, ocrObjec
             if (mdMsg->writeBack) {
                 ocrPolicyDomain_t * pd;
                 getCurrentEnv(&pd, NULL, NULL, NULL);
+                // The write-back displaces the current payload buffer. Local
+                // acquirers may still hold pointers into it (handed out at
+                // acquire and valid until their release), so it must not be
+                // freed while the user count is non-zero: park it and reclaim
+                // once the count drains to zero. With no user it is freed
+                // right away, as before.
+                bool hasUsers = (rself->attributes.numUsers > 0);
                 if (rself->backingPtrMsg) {
-                    pd->fcts.pdFree(pd, rself->backingPtrMsg);
+                    if (hasUsers) {
+                        parkDisplacedBuffer(rself, rself->backingPtrMsg, true);
+                    } else {
+                        pd->fcts.pdFree(pd, rself->backingPtrMsg);
+                    }
                 } else {
                     ocrAssert(self->ptr != NULL);
+                    if (hasUsers) {
+                        parkDisplacedBuffer(rself, self->ptr, false);
+                    } else {
                     PD_MSG_STACK(msg);
                     getCurrentEnv(NULL, NULL, NULL, &msg);
 #define PD_MSG (&msg)
@@ -2493,6 +2656,7 @@ static u8 lockableProcess(ocrObjectFactory_t * factory, ocrGuid_t guid, ocrObjec
                     RESULT_PROPAGATE(pd->fcts.processMessage(pd, &msg, false));
 #undef PD_MSG
 #undef PD_TYPE
+                    }
                 }
                 rself->backingPtrMsg = msg;
                 self->ptr = (void *) &(mdMsg->dbPtr);
@@ -2989,18 +3153,28 @@ static u8 lockableDeserialize(ocrObjectFactory_t * pfactory, ocrGuid_t dbGuid, o
                 rself->backingPtrMsg = msg;
             }
             self->ptr = &(mdRel->dbPtr);
+            // The registration below publishes the instance: a concurrently
+            // replayed or racing operation (e.g. a destroy) may then free both
+            // the instance and the carrying message right away. Capture every
+            // field of the message and the instance needed afterwards before
+            // publishing.
+            u64 dbSize = self->size;
             if (isCloneRelease) {
                 ocrPolicyDomain_t * pd;
                 getCurrentEnv(&pd, NULL, NULL, NULL);
+#ifndef LOCKABLE_RELEASE_ASYNC
+                u64 ackMsgId = msg->msgId;
+                ocrLocation_t ackSrcLocation = msg->srcLocation;
+#endif
                 // Registers the MD only now. Addresses the race where the DB would
                 // have been registered in M_CLONE but its data ptr is not yet set.
                 RESULT_ASSERT(pd->guidProviders[0]->fcts.registerGuid(pd->guidProviders[0], self->guid, (u64) self), ==, 0);
 #ifndef LOCKABLE_RELEASE_ASYNC
-                sendMdCommResponseAck(pd, msg->msgId, msg->srcLocation);
+                sendMdCommResponseAck(pd, ackMsgId, ackSrcLocation);
 #endif
             }
             retCode = OCR_EPEND;
-            curPtr = (curPtr + self->size);
+            curPtr = (curPtr + dbSize);
         } else {
             ocrAssert(false && "M_DATA only used for eager and cloneRelease");
         }

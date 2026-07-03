@@ -55,6 +55,20 @@
 #define IS_RESERVED_GUID(guidVal) ((guidVal.lower & 0x8000000000000000ULL) != 0ULL)
 #endif
 
+// A guid whose metadata lives at this location normally maps directly to the
+// metadata pointer. Staged creation, however, can install a locally-homed
+// metadata only after messages referencing the guid have begun to arrive
+// (e.g. a datablock created on behalf of this location is only written back
+// to it on release). During that window the guid's slot holds an MdProxy on
+// which early messages are parked; the proxy is tagged so resolvers do not
+// mistake it for the metadata pointer, and registering the metadata unparks
+// and replays the messages. Map values are allocator-returned pointers (at
+// least word-aligned), so the low bit is free to carry the tag.
+#define PENDING_PROXY_TAG             0x1ULL
+#define IS_PENDING_PROXY_SLOT(slot)   ((((u64)(slot)) & PENDING_PROXY_TAG) != 0ULL)
+#define PENDING_PROXY_FROM_SLOT(slot) ((MdProxy_t *) (((u64)(slot)) & ~PENDING_PROXY_TAG))
+#define TAG_PENDING_PROXY(proxyPtr)   ((void *) (((u64)(proxyPtr)) | PENDING_PROXY_TAG))
+
 #ifdef GUID_PROVIDER_CUSTOM_MAP
 // Set -DGUID_PROVIDER_CUSTOM_MAP and put other #ifdef for alternate implementation here
 #else
@@ -402,6 +416,19 @@ u8 labeledGuidCreateGuid(ocrGuidProvider_t* self, ocrFatGuid_t *fguid, u64 size,
             void * lguid = (void*)(fguid->guid.lower);
 #endif
             void *value = GP_HASHTABLE_TRYPUT(rself->guidImplTable, lguid, ptr);
+            if ((value != ptr) && IS_PENDING_PROXY_SLOT(value)) {
+                // The slot holds a pending metadata proxy parked by messages
+                // that arrived before any creation: it is not an installed
+                // object, so "already exists" does not apply. Compete for the
+                // creation by claiming the proxy's pointer field. The winner
+                // proceeds as the creator; its post-initialization
+                // registration publishes the slot and replays the parked
+                // messages. Losers observe the winner's object as the
+                // existing instance.
+                MdProxy_t * mdProxy = PENDING_PROXY_FROM_SLOT(value);
+                u64 prevVal = hal_cmpswap64(&(mdProxy->ptr), 0, (u64) ptr);
+                value = (prevVal == 0) ? ptr : ((void *) prevVal);
+            }
             if(value != ptr) {
                 DPRINTF(DEBUG_LVL_VVERB, "LabeledGUID: FAILED to insert (got %p instead of %p)\n",
                         value, ptr);
@@ -449,6 +476,18 @@ u8 labeledGuidCreateGuid(ocrGuidProvider_t* self, ocrFatGuid_t *fguid, u64 size,
                 void * lguid = (void*)(fguid->guid.guid);
 #endif
                 value = GP_HASHTABLE_TRYPUT(rself->guidImplTable, lguid, ptr);
+                if ((value != ptr) && IS_PENDING_PROXY_SLOT(value)) {
+                    // A pending metadata proxy parked by early messages is not
+                    // an installed object: claim it instead of waiting for a
+                    // destruction that would never come. On losing the claim,
+                    // an installed object now backs the guid and the usual
+                    // wait-for-destruction applies.
+                    MdProxy_t * mdProxy = PENDING_PROXY_FROM_SLOT(value);
+                    u64 prevVal = hal_cmpswap64(&(mdProxy->ptr), 0, (u64) ptr);
+                    if (prevVal == 0) {
+                        value = ptr;
+                    }
+                }
             } while(value != ptr);
         } else {
             // "Trust me" mode. We insert into the hashtable
@@ -459,7 +498,25 @@ u8 labeledGuidCreateGuid(ocrGuidProvider_t* self, ocrFatGuid_t *fguid, u64 size,
 #elif GUID_BIT_COUNT == 128
             void * lguid = (void*)(fguid->guid.guid);
 #endif
-            GP_HASHTABLE_PUT(rself->guidImplTable, lguid, ptr);
+            void * value = GP_HASHTABLE_TRYPUT(rself->guidImplTable, lguid, ptr);
+            if (value != ptr) {
+                if (IS_PENDING_PROXY_SLOT(value)) {
+                    // A pending metadata proxy parked by early messages is not
+                    // an installed object: claim it so the parked messages are
+                    // replayed once this creation registers its metadata. A
+                    // failed claim means a competing installation won the
+                    // guid, which the trusted mode's contract excludes.
+                    MdProxy_t * mdProxy = PENDING_PROXY_FROM_SLOT(value);
+                    u64 prevVal = hal_cmpswap64(&(mdProxy->ptr), 0, (u64) ptr);
+                    if ((prevVal != 0) && (prevVal != ((u64) ptr))) {
+                        DPRINTF(DEBUG_LVL_WARN, "LabeledGUID: trusted labeled creation of "GUIDF" lost to a concurrent installation\n", GUIDA(fguid->guid));
+                    }
+                } else {
+                    // Occupied by an installed object: keep the legacy
+                    // last-writer-wins insert for the trusted mode.
+                    GP_HASHTABLE_PUT(rself->guidImplTable, lguid, ptr);
+                }
+            }
         }
     } else { // Not labeled
         // Two cases, with MD the guid may already be known and we just need to allocate space for the clone
@@ -503,6 +560,55 @@ u8 labeledGuidCreateGuid(ocrGuidProvider_t* self, ocrFatGuid_t *fguid, u64 size,
 }
 
 
+// Close an MdProxy's waiter queue and re-process the messages that were
+// parked on it while the metadata was being resolved. The caller must have
+// published the metadata pointer (mdProxy->ptr, plus a fence) beforehand, so
+// that a waiter losing the enqueue race against the closing reads a valid
+// pointer. Replayed messages are re-dispatched asynchronously through
+// processRequestEdt.
+static void mdProxyCloseAndReplay(ocrGuidProvider_t * self, ocrGuid_t guid, MdProxy_t * mdProxy) {
+    u64 newValue = (u64) REG_CLOSED;
+    u64 curValue = 0;
+    u64 oldValue = 0;
+    do {
+        MdProxyNode_t * head = mdProxy->queueHead;
+        if (head == REG_CLOSED) {
+            // Already closed: a previous registration owned and replayed the
+            // queue; nothing left to do (makes completion calls idempotent).
+            return;
+        }
+        curValue = (u64) head;
+        oldValue = hal_cmpswap64((u64*) &(mdProxy->queueHead), curValue, newValue);
+    } while(oldValue != curValue);
+    MdProxyNode_t * queueHead = (MdProxyNode_t *) oldValue;
+    if (((u64)queueHead) != REG_OPEN) {
+        ocrGuid_t processRequestTemplateGuid;
+        ocrEdtTemplateCreate(&processRequestTemplateGuid, &processRequestEdt, 1, 0);
+        DPRINTF(DEBUG_LVL_VVERB,"About to process stored clone requests for GUID "GUIDF" queueHead=%p)\n", GUIDA(guid), queueHead);
+        //BUG #989: MT opportunity - Asynchronously process operations queued on the MD to be available
+        //TODO instead of going over these one after the other to find out they may not be enabled,
+        //submit the bulk to the MD so that it can sort it out
+        while (queueHead != ((void*) REG_OPEN)) { // sentinel value
+            DPRINTF(DEBUG_LVL_VVERB,"Processing stored clone requests for GUID "GUIDF"\n", GUIDA(guid));
+            ocrPolicyMsg_t * msg = queueHead->msg;
+            if ((msg->type & PD_MSG_TYPE_ONLY) == PD_MSG_DB_ACQUIRE) {
+                //TODO-MD-DBRTACQ
+                // This is to let the PD know the message is re-processed and
+                // there's no calling context that will read the response.
+                ocrAssert(msg->type & PD_MSG_REQ_RESPONSE);
+                msg->type &= ~PD_MSG_REQ_RESPONSE;
+            }
+            u64 paramv = (u64) queueHead->msg;
+            ocrPolicyDomain_t * pd = self->pd;
+            createProcessRequestEdtDistPolicy(pd, processRequestTemplateGuid, &paramv);
+            MdProxyNode_t * currNode = queueHead;
+            queueHead = queueHead->next;
+            pd->fcts.pdFree(pd, currNode);
+        }
+        ocrEdtTemplateDestroy(processRequestTemplateGuid);
+    }
+}
+
 /**
  * @brief Associate an already existing GUID to a value.
  * This is useful in the context of distributed-OCR to register
@@ -522,7 +628,63 @@ u8 labeledGuidRegisterGuid(ocrGuidProvider_t* self, ocrGuid_t guid, u64 val) {
     int oth = (int) locIdtoLocation(extractLocIdFromGuid(guid));
     if (isGpLocalGuidCheck(self, guid)) {
         // See BUG #928 on GUID issues
-        GP_HASHTABLE_PUT(dself->guidImplTable, (void *) rguid, (void *) val);
+        if (getKindFromGuid(guid) == OCR_GUID_DB) {
+            // Staged creation installs a locally-homed datablock's metadata
+            // only when the creating location writes the instance back;
+            // messages referencing the guid may already have arrived and
+            // parked on a pending proxy (see labeledGuidGetVal). Install with
+            // a try-put so installation cannot clobber a concurrently parked
+            // proxy: when the slot already holds one, publish the metadata
+            // through the proxy first (so waiters losing the enqueue race
+            // read a valid pointer), then in the slot, and finally close the
+            // queue and replay the parked messages.
+            void * installed = (void *) val;
+            void * oldSlot = (void *) GP_HASHTABLE_TRYPUT(dself->guidImplTable, (void *) rguid, installed);
+            if (oldSlot != installed) {
+                if (IS_PENDING_PROXY_SLOT(oldSlot)) {
+                    // Publish through the pending proxy. Its pointer field is
+                    // the single-winner arbiter against concurrent
+                    // installations, and registration is two-phase:
+                    //  - unclaimed (0): claim it. The metadata becomes
+                    //    resolvable (resolvers read it through the proxy) but
+                    //    the slot stays tagged and the parked messages are NOT
+                    //    replayed yet: the installer may still be processing
+                    //    the very message that carried the metadata, and a
+                    //    replayed operation (e.g. a destroy) would free state
+                    //    from under it. A follow-up registration of the same
+                    //    value - issued by the message broker once the
+                    //    carrying message is fully processed, or by a labeled
+                    //    creation that claimed the proxy at create time -
+                    //    completes the installation (next case).
+                    //  - already our value: the installation is complete;
+                    //    publish the slot, close the queue and replay the
+                    //    parked messages.
+                    //  - a competing installation's value: we lose and our
+                    //    instance is discarded, mirroring failed
+                    //    labeled-creation semantics.
+                    MdProxy_t * mdProxy = PENDING_PROXY_FROM_SLOT(oldSlot);
+                    u64 prevVal = hal_cmpswap64(&(mdProxy->ptr), 0, val);
+                    if (prevVal == val) {
+                        hal_fence();
+                        GP_HASHTABLE_PUT(dself->guidImplTable, (void *) rguid, installed);
+                        mdProxyCloseAndReplay(self, guid, mdProxy);
+                        // The pending proxy is deliberately not reclaimed: a
+                        // concurrent resolver may still hold a reference to it
+                        // (same no-eager-reclaim policy as proxies for
+                        // remotely-homed guids).
+                    } else if (prevVal != 0) {
+                        DPRINTF(DEBUG_LVL_WARN, "LabeledGUID: dropping register of "GUIDF": a competing labeled creation installed first\n", GUIDA(guid));
+                    }
+                } else {
+                    // The slot holds an installed object from a competing
+                    // labeled creation; keep the legacy last-writer-wins
+                    // update for that (non-pending) collision.
+                    GP_HASHTABLE_PUT(dself->guidImplTable, (void *) rguid, installed);
+                }
+            }
+        } else {
+            GP_HASHTABLE_PUT(dself->guidImplTable, (void *) rguid, (void *) val);
+        }
         ocrAssert(oth == self->pd->myLocation);
     } else {
         MdProxy_t * mdProxy = (MdProxy_t *) GP_HASHTABLE_GET(dself->guidImplTable, (void *) rguid);
@@ -530,42 +692,7 @@ u8 labeledGuidRegisterGuid(ocrGuidProvider_t* self, ocrGuid_t guid, u64 val) {
         ocrAssert(mdProxy != NULL);
         mdProxy->ptr = val;
         hal_fence(); // This may be redundant with the CAS
-        u64 newValue = (u64) REG_CLOSED;
-        u64 curValue = 0;
-        u64 oldValue = 0;
-        do {
-            MdProxyNode_t * head = mdProxy->queueHead;
-            ocrAssert(head != REG_CLOSED);
-            curValue = (u64) head;
-            oldValue = hal_cmpswap64((u64*) &(mdProxy->queueHead), curValue, newValue);
-        } while(oldValue != curValue);
-        MdProxyNode_t * queueHead = (MdProxyNode_t *) oldValue;
-        if (((u64)queueHead) != REG_OPEN) {
-            ocrGuid_t processRequestTemplateGuid;
-            ocrEdtTemplateCreate(&processRequestTemplateGuid, &processRequestEdt, 1, 0);
-            DPRINTF(DEBUG_LVL_VVERB,"About to process stored clone requests for GUID "GUIDF" queueHead=%p)\n", GUIDA(guid), queueHead);
-            //BUG #989: MT opportunity - Asynchronously process operations queued on the MD to be available
-            //TODO instead of going over these one after the other to find out they may not be enabled,
-            //submit the bulk to the MD so that it can sort it out
-            while (queueHead != ((void*) REG_OPEN)) { // sentinel value
-                DPRINTF(DEBUG_LVL_VVERB,"Processing stored clone requests for GUID "GUIDF"\n", GUIDA(guid));
-                ocrPolicyMsg_t * msg = queueHead->msg;
-                if ((msg->type & PD_MSG_TYPE_ONLY) == PD_MSG_DB_ACQUIRE) {
-                    //TODO-MD-DBRTACQ
-                    // This is to let the PD know the message is re-processed and
-                    // there's no calling context that will read the response.
-                    ocrAssert(msg->type & PD_MSG_REQ_RESPONSE);
-                    msg->type &= ~PD_MSG_REQ_RESPONSE;
-                }
-                u64 paramv = (u64) queueHead->msg;
-                ocrPolicyDomain_t * pd = self->pd;
-                createProcessRequestEdtDistPolicy(pd, processRequestTemplateGuid, &paramv);
-                MdProxyNode_t * currNode = queueHead;
-                queueHead = queueHead->next;
-                pd->fcts.pdFree(pd, currNode);
-            }
-            ocrEdtTemplateDestroy(processRequestTemplateGuid);
-        }
+        mdProxyCloseAndReplay(self, guid, mdProxy);
     }
     RETURN_PROFILE(0);
 }
@@ -607,23 +734,70 @@ u8 labeledGuidGetVal(ocrGuidProvider_t* self, ocrGuid_t guid, u64* val, ocrGuidK
     #error Unknown type of GUID
     #endif
     if (isGpLocalGuidCheck(self, guid)) {
-        *val = (u64) GP_HASHTABLE_GET(dself->guidImplTable, rguid);
-        DPRINTF(DEBUG_LVL_VERB, "LabeledGUID: got val for GUID "GUIDF": 0x%"PRIx64"\n", GUIDA(guid), *val);
-        if ((*val != 0) && IS_RESERVED_GUID(guid)) {
-            // Bug #627: We do not return until the GUID is valid. We test this
-            // by looking at the first field of ptr and waiting for it to be the GUID value (meaning the
-            // object has been initialized
-            volatile u64 * spinVal = val;
-            void * adjustedPtr = (((ocrObject_t *)(*spinVal))+1);
-            // See BUG #928 on GUID issues
+        u64 slotVal = (u64) GP_HASHTABLE_GET(dself->guidImplTable, rguid);
+        if (IS_PENDING_PROXY_SLOT(slotVal)) {
+            // The metadata is homed here but not installed yet (staged
+            // creation): the slot holds a pending proxy. Report the metadata
+            // as ABSENT even if an installer has already claimed the proxy:
+            // the installer may still be processing the very message that
+            // carried the metadata, and exposing the instance before the
+            // installation completes would let concurrent operations (e.g. a
+            // destroy) free state from under it. The slot is replaced by the
+            // raw metadata pointer when the installation completes; until
+            // then callers park on the proxy handed out here.
+            *val = 0;
+            if (proxy != NULL) {
+                *proxy = PENDING_PROXY_FROM_SLOT(slotVal);
+            }
+        } else if ((slotVal == 0) && (mode != MD_LOCAL) && (getKindFromGuid(guid) == OCR_GUID_DB)) {
+            // The caller needs a proxy to park on while the metadata is
+            // absent. The guid is homed here, so there is no other location
+            // to fetch from: the metadata arrives on its own when the
+            // creating location writes the instance back. Hence, whatever
+            // resolve mode was requested, only set up the pending proxy; no
+            // fetch is issued. Concurrent callers may race to install it;
+            // the map's try-put arbitrates.
+            *val = 0;
+            ocrAssert(proxy != NULL);
+            ocrPolicyDomain_t * pd = self->pd;
+            MdProxy_t * mdProxy = (MdProxy_t *) pd->fcts.pdMalloc(pd, sizeof(MdProxy_t));
+            mdProxy->queueHead = (void *) REG_OPEN; // sentinel value
+            mdProxy->ptr = 0;
+            hal_fence(); // The lock in try-put should make the writes visible
+            void * tagged = TAG_PENDING_PROXY(mdProxy);
+            void * oldSlot = (void *) GP_HASHTABLE_TRYPUT(dself->guidImplTable, rguid, tagged);
+            if (oldSlot == tagged) { // won: metadata still absent, pending proxy installed
+                *proxy = mdProxy;
+            } else { // lost: either another pending proxy or the metadata itself
+                pd->fcts.pdFree(pd, mdProxy);
+                if (IS_PENDING_PROXY_SLOT(oldSlot)) {
+                    // Still pending: report absent (see the pending case
+                    // above) and hand out the proxy to park on.
+                    *proxy = PENDING_PROXY_FROM_SLOT(oldSlot);
+                } else {
+                    // The metadata was installed concurrently
+                    *val = (u64) oldSlot;
+                }
+            }
+        } else {
+            *val = slotVal;
+            if ((*val != 0) && IS_RESERVED_GUID(guid)) {
+                // Bug #627: We do not return until the GUID is valid. We test this
+                // by looking at the first field of ptr and waiting for it to be the GUID value (meaning the
+                // object has been initialized
+                volatile u64 * spinVal = val;
+                void * adjustedPtr = (((ocrObject_t *)(*spinVal))+1);
+                // See BUG #928 on GUID issues
 #if GUID_BIT_COUNT == 64
-            while((*(volatile u64*)(adjustedPtr)) != guid.guid);
+                while((*(volatile u64*)(adjustedPtr)) != guid.guid);
 #elif GUID_BIT_COUNT == 128
-            while((*(volatile u64*)(adjustedPtr)) != guid.lower);
+                while((*(volatile u64*)(adjustedPtr)) != guid.lower);
 #endif
-            //Note: we do not cache label GUIDs because of race conditions on GUID_PROP_BLOCK
-            hal_fence(); // May be overkill but there is a race that I don't get
-        } // else val is not set and fall-through
+                //Note: we do not cache label GUIDs because of race conditions on GUID_PROP_BLOCK
+                hal_fence(); // May be overkill but there is a race that I don't get
+            } // else val is not set and fall-through
+        }
+        DPRINTF(DEBUG_LVL_VERB, "LabeledGUID: got val for GUID "GUIDF": 0x%"PRIx64"\n", GUIDA(guid), *val);
     } else {
         // The GUID is remote, check if we have a local representent or need to fetch
         *val = 0; // Important for return code to be set properly
@@ -700,10 +874,14 @@ u8 labeledGuidGetVal(ocrGuidProvider_t* self, ocrGuid_t guid, u64* val, ocrGuidK
 #undef PD_TYPE
             } else {
 #if defined(ENABLE_EXTENSION_DISTRIBUTED_LABELED) && defined(ENABLE_EXTENSION_COLLECTIVE_EVT)
-                // Concurrent reduction event creations compete through the MD proxy creation
-                ocrAssert((mode == MD_PROXY) ? (getKindFromGuid(guid) == OCR_GUID_EVENT_COLLECTIVE) : true);
+                // Concurrent reduction event creations compete through the MD proxy
+                // creation; datablock message brokering also resolves through
+                // MD_PROXY and may race a concurrent fetch's proxy creation.
+                ocrAssert((mode == MD_PROXY) ? ((getKindFromGuid(guid) == OCR_GUID_EVENT_COLLECTIVE) || (getKindFromGuid(guid) == OCR_GUID_DB)) : true);
 #else
-                ocrAssert(mode != MD_PROXY); // By contract, no competition on MD_PROXY
+                // By contract, no competition on MD_PROXY except datablock message
+                // brokering, which may race a concurrent fetch's proxy creation.
+                ocrAssert((mode != MD_PROXY) || (getKindFromGuid(guid) == OCR_GUID_DB));
 #endif
                 // lost competition, 2 cases:
                 // 1) The MD is available (it's concurrent to this thread of execution)

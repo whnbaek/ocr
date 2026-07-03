@@ -1709,6 +1709,27 @@ static u8 taskEpilogue(ocrTask_t * base, ocrPolicyDomain_t *pd, ocrWorker_t * cu
             if ((!(ocrGuidIsNull(depv[i].guid))) &&
                 ((j >= OCR_MAX_MULTI_SLOT) || (derived->doNotReleaseSlots[j] == 0) ||
                  ((j < OCR_MAX_MULTI_SLOT) && (((1ULL << (i % 64)) & derived->doNotReleaseSlots[j]) == 0)))) {
+                // A datablock this EDT created (or otherwise dynamically acquired)
+                // during execution is tracked for release in the unkDbs pass
+                // below. The user code may also have written such a datablock's
+                // guid into a dependence slot (e.g. to hand a freshly created
+                // block to a cloned continuation): that slot was never acquired
+                // by the dependence frontier - it was empty when the frontier
+                // ran, and the guid appeared only afterwards - so releasing it
+                // here would be a second, unmatched release of a single
+                // acquisition. Skip it; the unkDbs pass releases the creation
+                // reference exactly once.
+                bool releasedByUnkPass = false;
+                u64 u;
+                for (u = 0; u < derived->countUnkDbs; ++u) {
+                    if (ocrGuidIsEq(depv[i].guid, derived->unkDbs[u])) {
+                        releasedByUnkPass = true;
+                        break;
+                    }
+                }
+                if (releasedByUnkPass) {
+                    continue;
+                }
                 getCurrentEnv(NULL, NULL, NULL, &msg);
 #define PD_MSG (&msg)
 #define PD_TYPE PD_MSG_DB_RELEASE

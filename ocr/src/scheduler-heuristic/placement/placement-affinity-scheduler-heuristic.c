@@ -81,6 +81,10 @@ static u8 placerAffinitySchedHeuristicSwitchRunlevel(ocrSchedulerHeuristic_t *se
             // Following are cached from the PD
             ocrAssert(PD->platformModel != NULL);
             dself->platformModel = (ocrPlatformModelAffinity_t *) PD->platformModel;
+            // Seed at this domain's own location (now that the location count is
+            // available) so concurrent domains' round-robins interleave instead
+            // of every domain starting its placement sequence on location 0.
+            dself->edtLastPlacementIndex = (u64)dself->myLocation % dself->platformModel->pdLocAffinitiesSize;
         }
 
         break;

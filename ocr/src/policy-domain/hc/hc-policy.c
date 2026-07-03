@@ -124,6 +124,13 @@ static void printBindingInfo(ocrPolicyDomain_t * pd) {
 }
 #endif
 
+// The 'mode' word of a PD_MSG_METADATA_COMM is factory-specific. For the
+// datablock factories the low bit denotes an operation carrying a full
+// metadata clone; a push with that bit set is the very message that installs
+// the local metadata instance and therefore must never be parked waiting for
+// the instance to exist.
+#define MD_COMM_DB_MODE_CLONE 0x1
+
 // Utility function to enqueue a waiter when the metadata is being fetch
 // Impl will most likely move to runtime events
 static u64 enqueueMdProxyWaiter(ocrPolicyDomain_t * pd, MdProxy_t * mdProxy, ocrPolicyMsg_t * msg) {
@@ -2271,12 +2278,72 @@ u8 hcPolicyDomainProcessMessage(ocrPolicyDomain_t *self, ocrPolicyMsg_t *msg, u8
         shouldProcess |= (guidKind == OCR_GUID_EVENT_COLLECTIVE);
 #endif
         if (shouldProcess) {
-            // Rely on the DB's MD 'process' implementation. The call may be asynchronous.
+            // Rely on the MD 'process' implementation. The call may be asynchronous.
             u64 val = 0;
-            self->guidProviders[0]->fcts.getVal(self->guidProviders[0], guid, &val, NULL, MD_LOCAL, NULL);
+            bool completeInstall = false;
+            if (guidKind == OCR_GUID_DB) {
+                // Datablock operations are brokered by the guid's home policy
+                // domain, but staged creation installs a locally-homed
+                // datablock's metadata only when the creating location writes
+                // the instance back on release: an operation can reach the
+                // home before the metadata exists there. A push carrying a
+                // full metadata clone is the message that installs the
+                // instance (its deserialize path accepts an absent one) and is
+                // processed right away; every other operation requires the
+                // local instance, so while it is absent the message is parked
+                // on the MD proxy and replayed once the metadata is
+                // registered.
+                bool installsMd = (PD_MSG_FIELD_I(direction) == MD_DIR_PUSH) &&
+                                  ((PD_MSG_FIELD_I(mode) & MD_COMM_DB_MODE_CLONE) != 0);
+                if (installsMd) {
+                    self->guidProviders[0]->fcts.getVal(self->guidProviders[0], guid, &val, NULL, MD_LOCAL, NULL);
+                    completeInstall = (val == 0);
+                } else {
+                    MdProxy_t * mdProxy = NULL;
+                    self->guidProviders[0]->fcts.getVal(self->guidProviders[0], guid, &val, NULL, MD_PROXY, &mdProxy);
+                    if (val == 0) {
+                        ocrAssert(mdProxy != NULL);
+                        val = enqueueMdProxyWaiter(self, mdProxy, msg);
+                        if (val == 0) {
+                            // Parked: the message is replayed when the metadata is registered.
+                            RETURN_PROFILE(OCR_EPEND);
+                        }
+                    }
+                }
+            } else {
+                self->guidProviders[0]->fcts.getVal(self->guidProviders[0], guid, &val, NULL, MD_LOCAL, NULL);
+            }
             ocrObject_t * mdPtr = (ocrObject_t *) val;             // ASSERT(val != ((u64)0xffffffffffffffff));
             // This is potentially asynchronous as the MD may not be able to carry out the operation immediately
             returnCode = factory->process(factory, guid, mdPtr, msg);
+            if (completeInstall) {
+                // The message just installed the metadata that was absent
+                // (staged creation), and its processing is now complete: the
+                // installer is done using both the carrying message and the
+                // fresh instance. Complete the installation by re-registering
+                // the installed metadata, which publishes it in the guid's
+                // slot and replays the messages parked while it was absent.
+                // Replaying and publishing only at this point keeps
+                // concurrent or replayed operations (e.g. a destroy) from
+                // freeing the message or the instance from under the
+                // installer. The provider reports a pending guid as absent,
+                // so the installed value is read through the proxy, where the
+                // registration inside the installer claimed it.
+                u64 installedVal = 0;
+                MdProxy_t * instProxy = NULL;
+                // Probe with MD_LOCAL: a pending slot hands back its proxy in
+                // every mode, but an EMPTY slot stays untouched — MD_PROXY
+                // would allocate a fresh pending proxy for a guid destroyed
+                // between the claim and this completion probe, leaking it on
+                // a permanently dead slot.
+                self->guidProviders[0]->fcts.getVal(self->guidProviders[0], guid, &installedVal, NULL, MD_LOCAL, &instProxy);
+                if ((installedVal == 0) && (instProxy != NULL)) {
+                    installedVal = (u64) instProxy->ptr;
+                }
+                if (installedVal != 0) {
+                    self->guidProviders[0]->fcts.registerGuid(self->guidProviders[0], guid, installedVal);
+                }
+            }
             // If pending we return here as it may indicate the msg is now
             // being used by the MD and can be potentially concurrently freed
             if (returnCode == OCR_EPEND) {

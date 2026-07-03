@@ -56,6 +56,21 @@ typedef union {
 struct dbWaiter_t;
 struct _ocrPolicyMsg_t;
 
+/**
+ * A payload buffer displaced by an incoming write-back while local acquirers
+ * still held pointers into it. Pointers handed out by acquire remain valid
+ * until the acquirer releases, so a superseding write-back must not free the
+ * previous buffer while the user count is non-zero: it is parked on this list
+ * and reclaimed once the count drains to zero. Multiple write-backs can stack
+ * entries if the count never reaches zero in between.
+ */
+typedef struct _dbDisplacedBuf_t {
+    void * ptr;                      /**< buffer to reclaim */
+    bool isMsgBuf;                   /**< true: policy-message buffer (pdFree);
+                                          false: plain data payload (MEM_UNALLOC) */
+    struct _dbDisplacedBuf_t * next;
+} dbDisplacedBuf_t;
+
 // Must match DB_* definitions in the implementation
 #define DB_MODE_COUNT   4
 
@@ -130,6 +145,7 @@ typedef struct _ocrDataBlockLockable_t {
     struct _dbWaiter_t * localWaitQueues[DB_MODE_COUNT]; /** Per mode local waiters queued to acquire the db */
     Queue_t * remoteWaitQueues[DB_MODE_COUNT]; /** Per mode remote PD waiters queued to acquire the db */
     struct _ocrPolicyMsg_t * backingPtrMsg; /** Pointer to a policy message that stores the DB's data */
+    dbDisplacedBuf_t * displacedBufs; /** Write-back-displaced payload buffers awaiting user drain */
     // mdPeers: If the MD instance is the master one it is the PD that owns the guid. Else it is
     // the PD location to write the datablock back to.
     ocrLocation_t mdPeers;
