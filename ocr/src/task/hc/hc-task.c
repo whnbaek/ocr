@@ -438,16 +438,14 @@ static u8 initTaskHcInternal(ocrTaskHc_t *task, ocrGuid_t taskGuid, ocrPolicyDom
 #endif
 #endif
 
-    u32 i;
-    for(i = 0; i < OCR_MAX_MULTI_SLOT; ++i) {
-        task->doNotReleaseSlots[i] = 0ULL;
-    }
+    task->doNotReleaseSlots = NULL;
 
     if(task->base.depc == 0) {
         task->signalers = END_OF_LIST;
     }
 
 #ifdef ENABLE_EXTENSION_PERF
+    u32 i;
     for(i = 0; i < PERF_MAX - PERF_HW_MAX; i++) task->base.swPerfCtrs[i] = 0;
 #endif
 #ifdef TG_STAGING
@@ -484,6 +482,32 @@ static u8 initTaskHcInternal(ocrTaskHc_t *task, ocrGuid_t taskGuid, ocrPolicyDom
 }
 
 /**
+ * @brief Mark a dependence slot so its data-block is not released at epilogue
+ * The bitmap is sized by the task's depc and lazily allocated on first use;
+ * a NULL bitmap means no slot is marked. Callers run in the task's own
+ * acquire/execute path, so accesses are serialized per task.
+ */
+static void markDoNotReleaseSlot(ocrTaskHc_t *rself, u32 slot) {
+    ocrAssert(slot < rself->base.depc);
+    u32 nbWords = (rself->base.depc + 63) / 64;
+    if (rself->doNotReleaseSlots == NULL) {
+        ocrPolicyDomain_t *pd = NULL;
+        getCurrentEnv(&pd, NULL, NULL, NULL);
+        rself->doNotReleaseSlots = (u64 *) pd->fcts.pdMalloc(pd, nbWords * sizeof(u64));
+        u32 i;
+        for (i = 0; i < nbWords; ++i)
+            rself->doNotReleaseSlots[i] = 0ULL;
+    }
+    rself->doNotReleaseSlots[slot / 64] |= (1ULL << (slot % 64));
+}
+
+static bool isDoNotReleaseSlot(ocrTaskHc_t *rself, u32 slot) {
+    ocrAssert(slot < rself->base.depc);
+    return (rself->doNotReleaseSlots != NULL) &&
+           ((rself->doNotReleaseSlots[slot / 64] & (1ULL << (slot % 64))) != 0ULL);
+}
+
+/**
  * @brief Advance the DB iteration frontier to the next DB
  * This implementation iterates on the GUID-sorted signaler vector
  * Returns false when the end of depv is reached
@@ -506,9 +530,7 @@ static u8 iterateDbFrontier(ocrTask_t *self) {
                 rself->resolvedDeps[depv[i].slot].size = rself->resolvedDeps[depv[i-1].slot].size;
                 if((self->spadUsage) & (1<<(depv[i].slot))) rself->resolvedDeps[depv[i].slot].size |= SPAD_COPY;
 #endif
-                // If the below asserts, rebuild OCR with a higher OCR_MAX_MULTI_SLOT (in build/common.mk)
-                ocrAssert(depv[i].slot / 64 < OCR_MAX_MULTI_SLOT);
-                rself->doNotReleaseSlots[depv[i].slot / 64] |= (1ULL << (depv[i].slot % 64));
+                markDoNotReleaseSlot(rself, depv[i].slot);
             } else {
                 // Issue acquire request
                 ocrPolicyDomain_t * pd = NULL;
@@ -803,6 +825,10 @@ u8 destructTaskHc(ocrTask_t* base) {
     }
 #endif
 #endif
+    if (((ocrTaskHc_t*)base)->doNotReleaseSlots != NULL) {
+        pd->fcts.pdFree(pd, ((ocrTaskHc_t*)base)->doNotReleaseSlots);
+        ((ocrTaskHc_t*)base)->doNotReleaseSlots = NULL;
+    }
 #define PD_MSG (&msg)
 #define PD_TYPE PD_MSG_GUID_DESTROY
     msg.type = PD_MSG_GUID_DESTROY | PD_MSG_REQUEST;
@@ -1526,9 +1552,7 @@ u8 notifyDbReleaseTaskHc(ocrTask_t *base, ocrFatGuid_t db) {
                 DPRINTF(DEBUG_LVL_VVERB, "Dynamic Releasing DB (GUID "GUIDF") from EDT "GUIDF", "
                         "match in dependence list for count %"PRIu64"\n",
                         GUIDA(db.guid), GUIDA(base->guid), count);
-                // If the below asserts, rebuild OCR with a higher OCR_MAX_MULTI_SLOT (in build/common.mk)
-                ocrAssert(count / 64 < OCR_MAX_MULTI_SLOT);
-                if(derived->doNotReleaseSlots[count / 64 ] & (1ULL << (count % 64))) {
+                if(isDoNotReleaseSlot(derived, count)) {
                     DPRINTF(DEBUG_LVL_VVERB, "DB (GUID "GUIDF") already released from EDT "GUIDF" (dependence %"PRIu64")\n",
                             GUIDA(db.guid), GUIDA(base->guid), count);
                     return OCR_ENOENT;
@@ -1537,7 +1561,7 @@ u8 notifyDbReleaseTaskHc(ocrTask_t *base, ocrFatGuid_t db) {
                             "match in dependence list for count %"PRIu64"\n",
                             GUIDA(db.guid), GUIDA(base->guid), count);
 
-                    derived->doNotReleaseSlots[count / 64] |= (1ULL << (count % 64));
+                    markDoNotReleaseSlot(derived, count);
                     // we can return on the first instance found since iterateDbFrontier
                     // already marked duplicated DB and the selection sort in sortRegNode is stable.
                     return 0;
@@ -1566,13 +1590,16 @@ static void taskReset(ocrTask_t* base) {
     derived->unkDbs = NULL;
     derived->countUnkDbs = 0;
     derived->maxUnkDbs = 0;
-    for(i = 0; i < OCR_MAX_MULTI_SLOT; ++i) {
-        derived->doNotReleaseSlots[i] = 0ULL;
+    if (derived->doNotReleaseSlots != NULL) {
+        u32 nbWords = (base->depc + 63) / 64;
+        for(i = 0; i < nbWords; ++i) {
+            derived->doNotReleaseSlots[i] = 0ULL;
+        }
     }
     regNode_t * depv = derived->signalers;
     for (i = 1; i < base->depc; ++i) {
         if (ocrGuidIsEq(depv[i-1].guid, depv[i].guid)) {
-            derived->doNotReleaseSlots[depv[i].slot / 64] |= (1ULL << (depv[i].slot % 64));
+            markDoNotReleaseSlot(derived, depv[i].slot);
         }
     }
 #ifdef ENABLE_OCR_API_DEFERRABLE
@@ -1705,10 +1732,8 @@ static u8 taskEpilogue(ocrTask_t * base, ocrPolicyDomain_t *pd, ocrWorker_t * cu
         START_PROFILE(ta_hc_dbRel);
         u32 i;
         for(i=0; i < depc; ++i) {
-            u32 j = i / 64;
             if ((!(ocrGuidIsNull(depv[i].guid))) &&
-                ((j >= OCR_MAX_MULTI_SLOT) || (derived->doNotReleaseSlots[j] == 0) ||
-                 ((j < OCR_MAX_MULTI_SLOT) && (((1ULL << (i % 64)) & derived->doNotReleaseSlots[j]) == 0)))) {
+                !isDoNotReleaseSlot(derived, i)) {
                 // A datablock this EDT created (or otherwise dynamically acquired)
                 // during execution is tracked for release in the unkDbs pass
                 // below. The user code may also have written such a datablock's
@@ -2311,6 +2336,7 @@ ocrRuntimeHint_t* getRuntimeHintTaskHc(ocrTask_t* self) {
 #define SZ_HINTS(self)          ((hasProperty(((ocrTask_t*)self)->flags, OCR_TASK_FLAG_USES_HINTS) ? OCR_HINT_COUNT_EDT_HC : 0)*sizeof(u64))
 #define SZ_UNKDBS(self)         (((ocrTaskHc_t *)self)->countUnkDbs*sizeof(ocrGuid_t))
 #define SZ_RESOLVEDDEPS(self)   ((((ocrTaskHc_t *)self)->resolvedDeps == NULL) ? 0 : (((ocrTask_t*)self)->depc*sizeof(ocrEdtDep_t)))
+#define SZ_DNRSLOTS(self)       ((((ocrTaskHc_t *)self)->doNotReleaseSlots == NULL) ? 0 : (((((ocrTask_t*)self)->depc + 63) / 64)*sizeof(u64)))
 
 // Computes the address of a data-structure embedded in 'self'
 #define OFF_PARAMV(self)            (((char *) self) + sizeof(ocrTaskHc_t))
@@ -2318,13 +2344,14 @@ ocrRuntimeHint_t* getRuntimeHintTaskHc(ocrTask_t* self) {
 #define OFF_HINTS(self)             (OFF_SIGNALERS(self) + SZ_SIGNALERS(self))
 #define OFF_UNKDBS(self)            (OFF_HINTS(self) + SZ_HINTS(self))
 #define OFF_RESOLVEDDEPS(self)      (OFF_UNKDBS(self) + SZ_UNKDBS(self))
+#define OFF_DNRSLOTS(self)          (OFF_RESOLVEDDEPS(self) + SZ_RESOLVEDDEPS(self))
 
 //TODO-MD-EDT:
 //This is returning the size for a deep copy. Mode, whether it is an action or a type of size should reflect that.
 u8 mdSizeTaskFactoryHc(ocrObject_t *dest, u64 mode, u64 * size) {
     ocrTask_t * self = (ocrTask_t *) dest;
     *size = sizeof(ocrTaskHc_t) +
-        SZ_PARAMV(self) + SZ_SIGNALERS(self) + SZ_HINTS(self) + SZ_UNKDBS(self) + SZ_RESOLVEDDEPS(self);
+        SZ_PARAMV(self) + SZ_SIGNALERS(self) + SZ_HINTS(self) + SZ_UNKDBS(self) + SZ_RESOLVEDDEPS(self) + SZ_DNRSLOTS(self);
     return 0;
 }
 
@@ -2352,6 +2379,9 @@ u8 serializeTaskFactoryHc(ocrObjectFactory_t * factory, ocrGuid_t guid, ocrObjec
     ocrAssert(dself->unkDbs == NULL); // No use for it currently but code is here
     SER_WRITE(cur, dself->unkDbs, SZ_UNKDBS(dself));
     SER_WRITE(cur, dself->resolvedDeps, SZ_RESOLVEDDEPS(dself));
+    if (SZ_DNRSLOTS(dself)) {
+        SER_WRITE(cur, dself->doNotReleaseSlots, SZ_DNRSLOTS(dself));
+    }
     return 0;
 }
 
@@ -2387,6 +2417,12 @@ u8 deserializeTaskFactoryHc(ocrObjectFactory_t * pfactory, ocrGuid_t edtGuid, oc
     ocrAssert(((SZ_RESOLVEDDEPS(src) == 0) && (dst->resolvedDeps == NULL)) || 1);
     dst->resolvedDeps = pd->fcts.pdMalloc(pd, SZ_RESOLVEDDEPS(src));
     hal_memCopy(dst->resolvedDeps, OFF_RESOLVEDDEPS(src), SZ_RESOLVEDDEPS(src), false);
+    if (SZ_DNRSLOTS(src)) {
+        dst->doNotReleaseSlots = pd->fcts.pdMalloc(pd, SZ_DNRSLOTS(src));
+        hal_memCopy(dst->doNotReleaseSlots, OFF_DNRSLOTS(src), SZ_DNRSLOTS(src), false);
+    } else {
+        dst->doNotReleaseSlots = NULL;
+    }
     *dest = (ocrObject_t *) dst;
     return 0;
 }
@@ -2462,7 +2498,8 @@ u8 getSerializationSizeTaskHc(ocrTask_t* self, u64* size) {
                (derived->signalers ? self->depc*sizeof(regNode_t) : 0) +
                (derived->hint.hintVal ? OCR_HINT_COUNT_EDT_HC*sizeof(u64) : 0) +
                (derived->resolvedDeps ? self->depc*sizeof(ocrEdtDep_t) : 0) +
-               (derived->unkDbs ? derived->countUnkDbs*sizeof(ocrGuid_t) : 0);
+               (derived->unkDbs ? derived->countUnkDbs*sizeof(ocrGuid_t) : 0) +
+               (derived->doNotReleaseSlots ? ((self->depc + 63) / 64)*sizeof(u64) : 0);
 #endif
     self->base.size = taskSize;
     *size = taskSize;
@@ -2522,6 +2559,13 @@ u8 serializeTaskHc(ocrTask_t* self, u8* buffer) {
         hal_memCopy(buffer, derived->unkDbs, len, false);
         taskHcBuf->unkDbs = (ocrGuid_t*)buffer;
         taskHcBuf->maxUnkDbs = derived->countUnkDbs;
+        buffer += len;
+    }
+
+    if (derived->doNotReleaseSlots) {
+        len = ((self->depc + 63) / 64)*sizeof(u64);
+        hal_memCopy(buffer, derived->doNotReleaseSlots, len, false);
+        taskHcBuf->doNotReleaseSlots = (u64*)buffer;
         buffer += len;
     }
 
@@ -2590,6 +2634,13 @@ u8 deserializeTaskHc(u8* buffer, ocrTask_t** self) {
         buffer += len;
     }
 
+    if (taskHc->doNotReleaseSlots) {
+        len = ((task->depc + 63) / 64)*sizeof(u64);
+        taskHc->doNotReleaseSlots = (u64*)pd->fcts.pdMalloc(pd, len);
+        hal_memCopy(taskHc->doNotReleaseSlots, buffer, len, false);
+        buffer += len;
+    }
+
     ocrAssert((task->flags & OCR_TASK_FLAG_RUNTIME_EDT) == 0);
 
     *self = task;
@@ -2643,6 +2694,10 @@ u8 resetTaskHc(ocrTask_t *self) {
     if (dself->unkDbs != NULL) {
         pd->fcts.pdFree(pd, dself->unkDbs);
         dself->unkDbs = NULL;
+    }
+    if (dself->doNotReleaseSlots != NULL) {
+        pd->fcts.pdFree(pd, dself->doNotReleaseSlots);
+        dself->doNotReleaseSlots = NULL;
     }
     pd->fcts.pdFree(pd, self);
     return 0;

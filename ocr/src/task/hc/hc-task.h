@@ -11,10 +11,6 @@
 #include "ocr-config.h"
 #if defined(ENABLE_TASK_HC) || defined(ENABLE_TASKTEMPLATE_HC)
 
-#ifndef OCR_MAX_MULTI_SLOT
-#define OCR_MAX_MULTI_SLOT 1
-#endif
-
 #include "hc/hc.h"
 #include "ocr-hal.h"
 #include "ocr-task.h"
@@ -76,7 +72,12 @@ typedef struct {
     u32 maxUnkDbs;         /**< Maximum number in unkDbs */
     u32 mdState;           /**< State of this metadata - Impl. specific */
     ocrEdtDep_t * resolvedDeps; /**< List of satisfied dependences */
-    u64 doNotReleaseSlots[OCR_MAX_MULTI_SLOT];
+    u64 * doNotReleaseSlots; /**< Bitmap over dependence slots whose data-block
+                                  must not be released again at task epilogue
+                                  (duplicate dependences acquired once, or blocks
+                                  the user code already released/destroyed).
+                                  Lazily allocated, ceil(depc/64) words;
+                                  NULL means no bit is set */
     ocrRuntimeHint_t hint;
 #ifdef ENABLE_OCR_API_DEFERRABLE
 #ifdef ENABLE_OCR_API_DEFERRABLE_MT
