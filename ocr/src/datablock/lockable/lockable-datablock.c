@@ -40,12 +40,14 @@
 
 #define DBG_LVL_LAZY DEBUG_LVL_INFO
 
-// No-hint DB home placement policy: 1 = round-robin the home location
-// across all locations, 0 = pin the home to the creator (legacy behavior).
-// A build that wires this to a specific value on the command line takes
-// precedence; a standalone build still defaults to round-robin.
+// No-hint DB home placement policy: 0 = home stays on the creating location
+// (first-touch; the block inherits the distribution of whatever task created
+// it, and create/destroy metadata traffic stays local), 1 = round-robin the
+// home across all locations regardless of the creation site.  A build that
+// wires this to a specific value on the command line takes precedence; a
+// standalone build defaults to first-touch.
 #ifndef OCR_NOHINT_DB_HOME_ROUNDROBIN
-#define OCR_NOHINT_DB_HOME_ROUNDROBIN 1
+#define OCR_NOHINT_DB_HOME_ROUNDROBIN 0
 #endif
 
 // Distributed implementation of lockable datablock. On creation the DB
