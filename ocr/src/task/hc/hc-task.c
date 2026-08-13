@@ -2410,7 +2410,7 @@ u8 deserializeTaskFactoryHc(ocrObjectFactory_t * pfactory, ocrGuid_t edtGuid, oc
     dst->hint.hintVal = (u64 *) OFF_HINTS(dst);
     // Do the heap allocated ones
     ocrAssert(((SZ_UNKDBS(src) == 0) && (dst->unkDbs == NULL)) || 1);
-    if (SZ_UNKDBS(src)) {
+    if (SZ_UNKDBS(src) != 0) {
         dst->unkDbs = pd->fcts.pdMalloc(pd, SZ_UNKDBS(src));
         hal_memCopy(dst->unkDbs, OFF_UNKDBS(src), SZ_UNKDBS(src), false);
     }

@@ -10,8 +10,12 @@
 #include "debug.h"
 #include "ocr-types.h"
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+#ifndef __USE_GNU
 #define __USE_GNU
+#endif
 #include <unistd.h>
 #include <sched.h>
 #include <errno.h>

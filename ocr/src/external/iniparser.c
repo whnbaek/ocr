@@ -433,7 +433,7 @@ char * iniparser_getstring(dictionary * d, const char * key, char * def) {
 
         // We now replace thing in result
         assert(resultSize + strlen(sval2) <= ASCIILINESZ);
-        strncpy(resultPtr, sval2, strlen(sval2));
+        memcpy(resultPtr, sval2, strlen(sval2));
         resultPtr += strlen(sval2);
         resultSize += strlen(sval2);
         sval = startMatch + 1; // Continue the string
@@ -441,7 +441,7 @@ char * iniparser_getstring(dictionary * d, const char * key, char * def) {
     // Here we copy whatever is left to result
     if(sval != origSval) {
         assert(resultSize + strlen(sval) <= ASCIILINESZ);
-        strncpy(resultPtr, sval, strlen(sval) + 1);
+        memcpy(resultPtr, sval, strlen(sval) + 1);
         lc_key = strlwc(key);
         dictionary_set(d, lc_key, &(result[0]));
         sval = dictionary_get(d, lc_key, def); // Get the internally allocated one

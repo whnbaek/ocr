@@ -859,6 +859,9 @@ u8 satisfyEventHcCounted(ocrEvent_t *base, ocrFatGuid_t db, u32 slot) {
 
 static u32 setSatisfiedEventHcPersist(ocrEvent_t *base, ocrFatGuid_t db, locNode_t ** curHead, bool checkError) {
     ocrEventHc_t * devt = (ocrEventHc_t*) base;
+    // An already satisfied event contributes no peer list to notify: the
+    // out-parameter must still be defined on that return.
+    *curHead = NULL;
     hal_lock(&(devt->waitersLock));
     if ((devt->waitersCount == STATE_CHECKED_IN) ||
         (devt->waitersCount == STATE_CHECKED_OUT)) {
